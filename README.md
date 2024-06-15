@@ -39,5 +39,5 @@ docker run --name wiz-gadget -d \
 -v ./certificates/server.crt:/app/server.crt \
 -v ./certificates/server.key:/app/server.key \
 -p 8181:8181 \
-danielmoloney/wiz-gadget:v0.1.1
+danielmoloney/wiz-gadget:v1.0.0
 ```
