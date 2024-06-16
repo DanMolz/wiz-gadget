@@ -1,5 +1,12 @@
 # ✨ Wiz Gadget - Webhook ✨
 
+What does the Wiz Gadget do?
+1. Recieves requests from Wiz Tenant, typically from Wiz Automation Rules.
+2. Verifies Authentication and IP Address Whitelist.
+3. Checks if a scan for the target subscription is already in progress, if not will request a Wiz Subscription Scan.
+4. If a scan is already in progress, it will monitor the scan activity for the subscription and queue any additional requests.
+5. Was the scan is complete, it will start a new subscription scan for all outstanding requests.
+
 ## Configuration
 The following table list the available environment variables.
 
