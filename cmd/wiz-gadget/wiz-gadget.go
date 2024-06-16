@@ -125,10 +125,11 @@ func main() {
 		log.Fatalf("Failed to obtain Wiz OAuth token: %v", err)
 	}
 
-	http.HandleFunc("/webhook", WebhookHandler)
+	http.HandleFunc("/webhook", ipWhitelistMiddleware(WebhookHandler))
 
 	server := &http.Server{
-		Addr: serverConfig.Addr,
+		Addr:    serverConfig.Addr,
+		Handler: nil,
 	}
 
 	if _, err := os.Stat(serverConfig.CertFile); os.IsNotExist(err) {
@@ -144,16 +145,22 @@ func main() {
 	}
 }
 
+func ipWhitelistMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := getIPAddress(r)
+		if !isIPWhitelisted(ip) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			log.Printf("Forbidden request from IP: %s", ip)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}
+}
+
 func WebhookHandler(w http.ResponseWriter, r *http.Request) {
 	requestID := uuid.New().String()
 	ip := getIPAddress(r)
 	log.Printf("[%s] Request received from IP: %s", requestID, ip)
-
-	if !isIPWhitelisted(ip) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		log.Printf("[%s] Forbidden request from IP: %s", requestID, ip)
-		return
-	}
 
 	if !authenticate(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
