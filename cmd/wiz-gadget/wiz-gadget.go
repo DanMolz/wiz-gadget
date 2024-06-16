@@ -147,6 +147,7 @@ func main() {
 func WebhookHandler(w http.ResponseWriter, r *http.Request) {
 	requestID := uuid.New().String()
 	ip := getIPAddress(r)
+	log.Printf("[%s] Request received from IP: %s", requestID, ip)
 
 	if !isIPWhitelisted(ip) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
