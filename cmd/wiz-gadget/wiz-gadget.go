@@ -29,30 +29,57 @@ const (
 )
 
 var (
-	username        string
-	password        string
-	token           string
-	clientID        string
-	clientSecret    string
-	authURL         string
-	apiURL          string
-	ipWhitelist     []string
-	apiToken        string
-	tokenMutex      sync.Mutex
-	tokenExpires    time.Time
-	scanQueue       = make(map[string][]ScanRequest)
-	scanQueueMutex  sync.Mutex
-	scanStatus      = make(map[string]bool)
-	scanStatusMutex sync.Mutex
-	monitorStarted  map[string]bool          = make(map[string]bool)
-	monitorStop     map[string]chan struct{} = make(map[string]chan struct{})
-	monitorMutex    sync.Mutex
+	serverConfig Config
+	authConfig   AuthConfig
+	apiConfig    APIConfig
+	tokenManager TokenManager
+	scanManager  ScanManager
 )
+
+type Config struct {
+	Addr        string
+	CertFile    string
+	KeyFile     string
+	IPWhitelist []string
+}
+
+type AuthConfig struct {
+	Username     string
+	Password     string
+	Token        string
+	ClientID     string
+	ClientSecret string
+	AuthURL      string
+}
+
+type APIConfig struct {
+	APIURL string
+}
+
+type TokenManager struct {
+	token     string
+	expiresAt time.Time
+	mu        sync.Mutex
+}
+
+type ScanManager struct {
+	scanQueue      map[string][]ScanRequest
+	scanStatus     map[string]bool
+	monitorStarted map[string]bool
+	monitorStop    map[string]chan struct{}
+	mu             sync.Mutex
+}
 
 type ScanRequest struct {
 	RequestID      string
 	Payload        models.WebhookPayload
 	ResponseWriter http.ResponseWriter
+}
+
+type OAuthTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int    `json:"expires_in"`
+	TokenType   string `json:"token_type"`
 }
 
 func init() {
@@ -65,48 +92,54 @@ func init() {
 		log.Println(".env file loaded successfully")
 	}
 
-	username = os.Getenv("BASIC_AUTH_USERNAME")
-	password = os.Getenv("BASIC_AUTH_PASSWORD")
-	token = os.Getenv("TOKEN_AUTH")
-	clientID = os.Getenv("OAUTH_CLIENT_ID")
-	clientSecret = os.Getenv("OAUTH_CLIENT_SECRET")
-	authURL = os.Getenv("OAUTH_AUTH_URL")
-	apiURL = os.Getenv("API_URL")
+	serverConfig = Config{
+		Addr:        ":8181",
+		CertFile:    crtFile,
+		KeyFile:     keyFile,
+		IPWhitelist: getIPWhitelist(),
+	}
 
-	ipWhitelistEnv := os.Getenv("IP_WHITELIST")
-	if ipWhitelistEnv != "" {
-		ipWhitelist = strings.Split(ipWhitelistEnv, ",")
-	} else {
-		log.Fatal("IP_WHITELIST environment variable is not set")
+	authConfig = AuthConfig{
+		Username:     os.Getenv("BASIC_AUTH_USERNAME"),
+		Password:     os.Getenv("BASIC_AUTH_PASSWORD"),
+		Token:        os.Getenv("TOKEN_AUTH"),
+		ClientID:     os.Getenv("OAUTH_CLIENT_ID"),
+		ClientSecret: os.Getenv("OAUTH_CLIENT_SECRET"),
+		AuthURL:      os.Getenv("OAUTH_AUTH_URL"),
+	}
+
+	apiConfig = APIConfig{
+		APIURL: os.Getenv("API_URL"),
+	}
+
+	scanManager = ScanManager{
+		scanQueue:      make(map[string][]ScanRequest),
+		scanStatus:     make(map[string]bool),
+		monitorStarted: make(map[string]bool),
+		monitorStop:    make(map[string]chan struct{}),
 	}
 }
 
-type OAuthTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int    `json:"expires_in"`
-}
-
 func main() {
-	if err := getOAuthToken(); err != nil {
+	if err := tokenManager.getOAuthToken(); err != nil {
 		log.Fatalf("Failed to obtain Wiz OAuth token: %v", err)
 	}
 
 	http.HandleFunc("/webhook", WebhookHandler)
 
 	server := &http.Server{
-		Addr: ":8181",
+		Addr: serverConfig.Addr,
 	}
 
-	if _, err := os.Stat(crtFile); os.IsNotExist(err) {
-		log.Fatalf("Certificate file %s not found, stopping application", crtFile)
+	if _, err := os.Stat(serverConfig.CertFile); os.IsNotExist(err) {
+		log.Fatalf("Certificate file %s not found, stopping application", serverConfig.CertFile)
 	}
-	if _, err := os.Stat(keyFile); os.IsNotExist(err) {
-		log.Fatalf("Key file %s not found, stopping application", keyFile)
+	if _, err := os.Stat(serverConfig.KeyFile); os.IsNotExist(err) {
+		log.Fatalf("Key file %s not found, stopping application", serverConfig.KeyFile)
 	}
 
 	log.Printf("Wiz Gadget now listening on port %s", server.Addr)
-	if err := server.ListenAndServeTLS(crtFile, keyFile); err != nil {
+	if err := server.ListenAndServeTLS(serverConfig.CertFile, serverConfig.KeyFile); err != nil {
 		log.Fatalf("Failed to start HTTPS server: %v", err)
 	}
 }
@@ -155,7 +188,7 @@ func WebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	logRequestDetails(requestID, payload)
 
-	if err := handleScanRequest(requestID, payload, w); err != nil {
+	if err := scanManager.handleScanRequest(requestID, payload, w); err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		log.Printf("[%s] Error while handling scan request: %v", requestID, err)
 		return
@@ -181,7 +214,7 @@ func getIPAddress(r *http.Request) string {
 }
 
 func isIPWhitelisted(ip string) bool {
-	for _, whitelistedIP := range ipWhitelist {
+	for _, whitelistedIP := range serverConfig.IPWhitelist {
 		if ip == whitelistedIP {
 			return true
 		}
@@ -201,28 +234,39 @@ func authenticate(r *http.Request) bool {
 			return false
 		}
 		creds := strings.SplitN(string(decoded), ":", 2)
-		return len(creds) == 2 && creds[0] == username && creds[1] == password
+		return len(creds) == 2 && creds[0] == authConfig.Username && creds[1] == authConfig.Password
 	}
 
 	if strings.HasPrefix(auth, bearerPrefix) {
-		return auth[len(bearerPrefix):] == token
+		return auth[len(bearerPrefix):] == authConfig.Token
 	}
 
 	return false
+}
+
+func getIPWhitelist() []string {
+	ipWhitelistEnv := os.Getenv("IP_WHITELIST")
+	if ipWhitelistEnv == "" {
+		log.Fatal("IP_WHITELIST environment variable is not set")
+	}
+	return strings.Split(ipWhitelistEnv, ",")
 }
 
 func isValidPayload(payload models.WebhookPayload) bool {
 	return payload.Event.SubjectResource.AccountExternalID != ""
 }
 
-func getOAuthToken() error {
+func (tm *TokenManager) getOAuthToken() error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
 	data := url.Values{}
 	data.Set("grant_type", "client_credentials")
-	data.Set("client_id", clientID)
-	data.Set("client_secret", clientSecret)
+	data.Set("client_id", authConfig.ClientID)
+	data.Set("client_secret", authConfig.ClientSecret)
 	data.Set("audience", "wiz-api")
 
-	req, err := http.NewRequest("POST", authURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequest("POST", authConfig.AuthURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return err
 	}
@@ -246,37 +290,33 @@ func getOAuthToken() error {
 		return err
 	}
 
-	tokenMutex.Lock()
-	apiToken = tokenResp.AccessToken
-	tokenExpires = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-	tokenMutex.Unlock()
+	tm.token = tokenResp.AccessToken
+	tm.expiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 
 	return nil
 }
 
-func handleScanRequest(requestID string, payload models.WebhookPayload, w http.ResponseWriter) error {
-	tokenMutex.Lock()
-	token := apiToken
-	expires := tokenExpires
-	tokenMutex.Unlock()
+func (sm *ScanManager) handleScanRequest(requestID string, payload models.WebhookPayload, w http.ResponseWriter) error {
+	tokenManager.mu.Lock()
+	token := tokenManager.token
+	expires := tokenManager.expiresAt
+	tokenManager.mu.Unlock()
 
 	// Refresh the token if it's about to expire
 	if time.Until(expires) < 1*time.Minute {
-		if err := getOAuthToken(); err != nil {
+		if err := tokenManager.getOAuthToken(); err != nil {
 			return err
 		}
-		tokenMutex.Lock()
-		token = apiToken
-		tokenMutex.Unlock()
+		tokenManager.mu.Lock()
+		token = tokenManager.token
+		tokenManager.mu.Unlock()
 	}
 
-	// Extract account ID from the payload
 	accountExternalID := payload.Event.SubjectResource.AccountExternalID
 	if accountExternalID == "" {
 		return fmt.Errorf("account ID not found in the payload")
 	}
 
-	// Get the resource ID for the account
 	cloudAccountDetailsResponse, err := cloudAccountDetails(token, accountExternalID)
 	if err != nil {
 		return err
@@ -284,57 +324,45 @@ func handleScanRequest(requestID string, payload models.WebhookPayload, w http.R
 	resourceID := cloudAccountDetailsResponse.CloudAccounts.Nodes[0].ID
 	log.Printf("[%s] Resource ID for account ID %s is %s", requestID, accountExternalID, resourceID)
 
-	// Check if a scan is already in progress for the account
-	if !scanStatus[accountExternalID] {
-		scanStatusMutex.Lock()
-		log.Printf("[%s] Checking if a scan is already in progress for resource ID %s", requestID, resourceID)
-		scanStatus[accountExternalID], _ = checkScanInProgress(token, resourceID)
-		scanStatusMutex.Unlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if !sm.scanStatus[accountExternalID] {
+		log.Printf("[%s] Checking if a scan/s is already in progress for resource ID %s", requestID, resourceID)
+		sm.scanStatus[accountExternalID], _ = checkScanInProgress(token, resourceID)
 	}
 
-	// If a scan is in progress, queue the request
-	scanStatusMutex.Lock()
-	if scanStatus[accountExternalID] {
-		log.Printf("[%s] Scan is already in progress for account ID: %s", requestID, accountExternalID)
-		scanStatusMutex.Unlock()
+	if sm.scanStatus[accountExternalID] {
+		log.Printf("[%s] Scan/s is already in progress for account ID: %s", requestID, accountExternalID)
 
-		// Queue the request
-		scanQueueMutex.Lock()
-		scanQueue[accountExternalID] = append(scanQueue[accountExternalID], ScanRequest{
+		sm.scanQueue[accountExternalID] = append(sm.scanQueue[accountExternalID], ScanRequest{
 			RequestID:      requestID,
 			Payload:        payload,
 			ResponseWriter: w,
 		})
-		scanQueueMutex.Unlock()
-		log.Printf("[%s] Scan request queued for account ID: %s. Your request has been queued.", requestID, accountExternalID)
-		log.Printf("[%s] Queue length for account ID: %s is %d", requestID, accountExternalID, len(scanQueue[accountExternalID]))
 
-		// Start monitoring if not already started
-		monitorMutex.Lock()
-		if !monitorStarted[accountExternalID] {
-			// Start the monitor only once
+		log.Printf("[%s] Scan request queued for account ID: %s. Your request has been queued.", requestID, accountExternalID)
+		log.Printf("[%s] Queue length for account ID: %s is %d", requestID, accountExternalID, len(sm.scanQueue[accountExternalID]))
+
+		if !sm.monitorStarted[accountExternalID] {
 			stopCh := make(chan struct{})
-			monitorStop[accountExternalID] = stopCh
-			monitorStarted[accountExternalID] = true
-			go monitorScanCompletion(accountExternalID, resourceID, stopCh)
+			sm.monitorStop[accountExternalID] = stopCh
+			sm.monitorStarted[accountExternalID] = true
+			go sm.monitorScanCompletion(accountExternalID, resourceID, stopCh)
 		}
-		monitorMutex.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"message": "Scan already in progress. Your request has been queued."})
 		return nil
 	}
-	scanStatusMutex.Unlock()
 
-	// Start the resource scan
 	log.Printf("[%s] Calling Wiz API RequestResourceScan for resource ID: %s", requestID, resourceID)
-	resourceScanResponse, err := wiz.RequestResourceScan(token, apiURL, resourceID)
+	resourceScanResponse, err := wiz.RequestResourceScan(token, apiConfig.APIURL, resourceID)
 	if err != nil {
 		return err
 	}
 
-	// Return the response
 	responseBody, ok := resourceScanResponse.(map[string]interface{})
 	if !ok {
 		return fmt.Errorf("unexpected response format")
@@ -349,9 +377,9 @@ func handleScanRequest(requestID string, payload models.WebhookPayload, w http.R
 	return nil
 }
 
-func monitorScanCompletion(accountExternalID, resourceID string, stopCh <-chan struct{}) {
+func (sm *ScanManager) monitorScanCompletion(accountExternalID, resourceID string, stopCh <-chan struct{}) {
 	log.Printf("Monitoring scan completion for account ID: %s, resource ID: %s", accountExternalID, resourceID)
-	ticker := time.NewTicker(15 * time.Minute) // adjust interval as needed
+	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -360,9 +388,9 @@ func monitorScanCompletion(accountExternalID, resourceID string, stopCh <-chan s
 			log.Printf("Stopping monitor for account ID: %s", accountExternalID)
 			return
 		case <-ticker.C:
-			tokenMutex.Lock()
-			token := apiToken
-			tokenMutex.Unlock()
+			tokenManager.mu.Lock()
+			token := tokenManager.token
+			tokenManager.mu.Unlock()
 
 			log.Printf("Checking scan status for account ID: %s, resource ID: %s", accountExternalID, resourceID)
 			checkScanInProgressResponse, err := checkScanInProgress(token, resourceID)
@@ -373,31 +401,24 @@ func monitorScanCompletion(accountExternalID, resourceID string, stopCh <-chan s
 			if !checkScanInProgressResponse {
 				log.Printf("Scan/s completed for account ID: %s, resource ID: %s", accountExternalID, resourceID)
 
-				scanStatusMutex.Lock()
-				delete(scanStatus, accountExternalID)
-				scanStatusMutex.Unlock()
-
-				scanQueueMutex.Lock()
-				queuedRequests := scanQueue[accountExternalID]
-				delete(scanQueue, accountExternalID)
-				scanQueueMutex.Unlock()
+				sm.mu.Lock()
+				delete(sm.scanStatus, accountExternalID)
+				queuedRequests := sm.scanQueue[accountExternalID]
+				delete(sm.scanQueue, accountExternalID)
+				sm.mu.Unlock()
 
 				if queuedRequests != nil {
 					log.Printf("Processing queued scan requests for account ID: %s, resource ID: %s", accountExternalID, resourceID)
-					// handleScanRequest(queuedRequests[0].RequestID, queuedRequests[0].Payload, queuedRequests[0].ResponseWriter)
-
-					// Start the resource scan
-					log.Printf("[%s] Calling Wiz API RequestResourceScan for resource ID: %s", queuedRequests[0].RequestID, resourceID)
-					_, err := wiz.RequestResourceScan(token, apiURL, resourceID)
+					_, err := wiz.RequestResourceScan(token, apiConfig.APIURL, resourceID)
 					if err != nil {
 						return
 					}
 				}
 
-				monitorMutex.Lock()
-				delete(monitorStarted, accountExternalID)
-				delete(monitorStop, accountExternalID)
-				monitorMutex.Unlock()
+				sm.mu.Lock()
+				delete(sm.monitorStarted, accountExternalID)
+				delete(sm.monitorStop, accountExternalID)
+				sm.mu.Unlock()
 
 				return
 			}
@@ -421,7 +442,7 @@ func checkScanInProgress(token, resourceID string) (bool, error) {
 }
 
 func cloudAccountDetails(token, accountExternalID string) (models.CloudAccountsResponse, error) {
-	cloudAccountsResponse, err := wiz.CloudAccounts(token, apiURL, accountExternalID)
+	cloudAccountsResponse, err := wiz.CloudAccounts(token, apiConfig.APIURL, accountExternalID)
 	if err != nil {
 		return models.CloudAccountsResponse{}, err
 	}
@@ -430,7 +451,7 @@ func cloudAccountDetails(token, accountExternalID string) (models.CloudAccountsR
 }
 
 func systemActivityStatus(token, resourceID string) (models.SystemActivityResponse, error) {
-	systemActivityResponse, err := wiz.SystemActivityLogTable(token, apiURL, resourceID)
+	systemActivityResponse, err := wiz.SystemActivityLogTable(token, apiConfig.APIURL, resourceID)
 	if err != nil {
 		return models.SystemActivityResponse{}, err
 	}
