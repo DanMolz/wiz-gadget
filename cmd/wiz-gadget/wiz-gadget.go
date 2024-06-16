@@ -324,7 +324,7 @@ func handleScanRequest(requestID string, payload models.WebhookPayload, w http.R
 	}
 	scanStatusMutex.Unlock()
 
-	// Start the scan
+	// Start the resource scan
 	log.Printf("[%s] Calling Wiz API RequestResourceScan for resource ID: %s", requestID, resourceID)
 	resourceScanResponse, err := wiz.RequestResourceScan(token, apiURL, resourceID)
 	if err != nil {
@@ -381,7 +381,14 @@ func monitorScanCompletion(accountExternalID, resourceID string, stopCh <-chan s
 
 				if queuedRequests != nil {
 					log.Printf("Processing queued scan requests for account ID: %s, resource ID: %s", accountExternalID, resourceID)
-					handleScanRequest(queuedRequests[0].RequestID, queuedRequests[0].Payload, queuedRequests[0].ResponseWriter)
+					// handleScanRequest(queuedRequests[0].RequestID, queuedRequests[0].Payload, queuedRequests[0].ResponseWriter)
+
+					// Start the resource scan
+					log.Printf("[%s] Calling Wiz API RequestResourceScan for resource ID: %s", queuedRequests[0].RequestID, resourceID)
+					_, err := wiz.RequestResourceScan(token, apiURL, resourceID)
+					if err != nil {
+						return
+					}
 				}
 
 				monitorMutex.Lock()
