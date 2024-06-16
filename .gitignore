@@ -1,5 +1,5 @@
 .env
 notes.md
 certificates/
-.crt
-.key
+server.crt
+server.key
