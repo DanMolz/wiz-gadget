@@ -322,7 +322,7 @@ func handleScanRequest(requestID string, payload models.WebhookPayload, w http.R
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode("Your request has been queued.")
+		json.NewEncoder(w).Encode(map[string]string{"message": "Scan already in progress. Your request has been queued."})
 		return nil
 	}
 	scanStatusMutex.Unlock()
